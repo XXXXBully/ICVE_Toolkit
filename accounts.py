@@ -14,12 +14,17 @@ accounts.json 结构:
 
 import json
 import os
+import sys
 from typing import Optional
 
 from utils import log
 
-# 账号文件路径(与本模块同目录)
-ACCOUNTS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "accounts.json")
+# 账号文件路径(与本模块同目录;打包成 exe 后取 exe 所在目录,避免写入临时解压目录)
+if getattr(sys, "frozen", False):
+    _BASE_DIR = os.path.dirname(os.path.abspath(sys.executable))
+else:
+    _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+ACCOUNTS_FILE = os.path.join(_BASE_DIR, "accounts.json")
 
 
 def load_accounts() -> dict:

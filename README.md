@@ -1,5 +1,13 @@
 # ICVE_Toolkit
 
+[![Python](https://img.shields.io/badge/Python-3.8%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
+[![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20macOS%20%7C%20Linux-555?logo=windows&logoColor=white)](#快速开始)
+[![License](https://img.shields.io/badge/License-CC%20BY--NC--SA%204.0-EF9421?logo=creativecommons&logoColor=white)](./LICENSE)
+[![Release](https://img.shields.io/badge/Release-v1.0.0-2EA44F?logo=github&logoColor=white)](https://github.com/atvkh/ICVE_Toolkit/releases)
+[![Stars](https://img.shields.io/github/stars/atvkh/ICVE_Toolkit?style=flat&logo=github&color=yellow)](https://github.com/atvkh/ICVE_Toolkit/stargazers)
+[![Forks](https://img.shields.io/github/forks/atvkh/ICVE_Toolkit?style=flat&logo=github&color=blue)](https://github.com/atvkh/ICVE_Toolkit/forks)
+[![Issues](https://img.shields.io/github/issues/atvkh/ICVE_Toolkit?style=flat&logo=github&color=orange)](https://github.com/atvkh/ICVE_Toolkit/issues)
+
 > 本项目原为非公开的内部工具。因资源被盗取并用于商业牟利，经确认盗用者身份后，决定将核心功能完整开源。
 
 ## 目录
