@@ -3,7 +3,7 @@
 [![Python](https://img.shields.io/badge/Python-3.8%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20macOS%20%7C%20Linux-555?logo=windows&logoColor=white)](#快速开始)
 [![License](https://img.shields.io/badge/License-CC%20BY--NC--SA%204.0-EF9421?logo=creativecommons&logoColor=white)](./LICENSE)
-[![Release](https://img.shields.io/badge/Release-v1.0.0-2EA44F?logo=github&logoColor=white)](https://github.com/atvkh/ICVE_Toolkit/releases)
+[![Release](https://img.shields.io/github/v/release/atvkh/ICVE_Toolkit?logo=github&color=2EA44F)](https://github.com/atvkh/ICVE_Toolkit/releases/latest)
 [![Stars](https://img.shields.io/github/stars/atvkh/ICVE_Toolkit?style=flat&logo=github&color=yellow)](https://github.com/atvkh/ICVE_Toolkit/stargazers)
 [![Forks](https://img.shields.io/github/forks/atvkh/ICVE_Toolkit?style=flat&logo=github&color=blue)](https://github.com/atvkh/ICVE_Toolkit/forks)
 [![Issues](https://img.shields.io/github/issues/atvkh/ICVE_Toolkit?style=flat&logo=github&color=orange)](https://github.com/atvkh/ICVE_Toolkit/issues)
@@ -126,6 +126,12 @@
 - Windows / macOS / Linux
 
 ### 安装
+
+**方式一:免安装(推荐小白)**
+
+从 [Releases](https://github.com/atvkh/ICVE_Toolkit/releases/latest) 下载 `ICVE_Toolkit.exe`,双击即可运行,无需安装 Python 环境。
+
+**方式二:源码运行**
 
 ```bash
 git clone https://github.com/atvkh/ICVE_Toolkit.git
