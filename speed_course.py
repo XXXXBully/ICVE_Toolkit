@@ -1,0 +1,899 @@
+"""刷课模块:SPOC / MOOC / 资源库三类课程刷课 + 自动答题 + 讨论自动回复。
+
+支持两种模式:
+- 快速模式:并发提交心跳包,效率最优
+- 模拟真实模式:逐条发送,随机间隔,降低被检测风险
+
+刷课范围:
+- all:进度 + 答题 + 讨论
+- progress:仅进度
+- exam:仅答题
+- discussion:仅讨论
+"""
+
+import json
+import random
+import time
+import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Optional
+
+from zjy_client import (
+    ZjyClient, BASE_URL, IMAGE_TYPES, VIDEO_TYPES,
+    extract_file_url, get_mp4_duration,
+)
+from utils import log
+
+# 讨论自动生成内容
+DISCUSS_TITLES = [
+    "学习心得与感悟", "关于本章节内容的思考", "这节课收获很大",
+    "谈谈对这门课程的理解", "非常有意义的学习内容", "对本课知识点的总结",
+]
+DISCUSS_CONTENTS = [
+    "老师讲解得很细致，课件的结构也很清晰，帮助我快速理解了核心知识点，非常感谢老师！",
+    "这部分内容非常实用，结合了实际案例，生动形象。学完之后有很大的启发，期待以后的课程。",
+    "课件做得太好了，通俗易懂，重点和难点都标记得很明确，自主学习效率极高！",
+    "老师的教学方法很棒，由浅入深，每个细节都照顾到了。我已经做好了笔记，下课会认真复习。",
+    "本章节讲述的内容对我有很大帮助，解答了我之前很多的疑惑，感觉对这门专业有了更深的认识。",
+    "内容非常充实，逻辑性很强。感觉跟着老师的节奏能够轻松掌握核心，谢谢老师的辛苦付出！",
+    "这节课的学习让我受益匪浅，不仅掌握了理论知识，还理解了如何在实际中应用，真的很棒。",
+]
+
+
+def run_speed_course(client: ZjyClient, course: dict, speed_type: str = "all",
+                     simulate_real: bool = False) -> None:
+    """一键自动刷课。
+
+    :param client: ZjyClient 实例
+    :param course: 课程 dict,需含 classId/courseInfoId/courseId/_courseType/courseName
+    :param speed_type: "all" | "progress" | "discussion"
+    :param simulate_real: True=模拟真实(逐条间隔),False=快速并发
+    """
+    class_id = course.get("classId", "")
+    course_info_id = course.get("courseInfoId", "")
+    course_id = course.get("courseId", "")
+    ctype = course.get("_courseType", "") or course.get("ctype", "") or "SPOC"
+    course_name = course.get("courseName", "未知课程")
+    nickname = (client.user_info or {}).get("nickName", "未知")
+
+    log(f"[{nickname}] 🚀 启动刷课: {course_name} (类型:{ctype}, 模式:{speed_type})", "INFO")
+
+    try:
+        # Part 1: 刷进度
+        if speed_type in ["all", "progress"]:
+            _brush_progress(client, nickname, class_id, course_info_id, course_id, ctype, simulate_real)
+
+        # Part 1.5: 自动答题(进度刷完后,刷讨论前)
+        if speed_type in ["all", "exam"]:
+            _brush_exam(client, nickname, class_id, course_info_id, course_id, ctype)
+
+        # Part 2: 刷讨论
+        if speed_type in ["all", "discussion"]:
+            _brush_discussion(client, nickname, class_id, course_info_id, course_id, ctype)
+
+    except Exception as e:
+        log(f"[{nickname}] 刷课异常: {e}", "ERROR")
+
+    log(f"[{nickname}] 🏁 刷课结束: {course_name}", "INFO")
+
+
+# ==================== Part 1: 刷进度 ====================
+
+def _brush_progress(client: ZjyClient, nickname: str, class_id: str,
+                     course_info_id: str, course_id: str, ctype: str,
+                     simulate_real: bool) -> None:
+    """刷课件进度:SPOC/MOOC/资源库三分支。"""
+    log(f"[{nickname}] 🚀 开始秒刷课件进度...", "INFO")
+
+    # 先扫描未完成的课件
+    leaf_cells = client.get_course_cells(course_info_id, class_id, course_id, include_completed=False, ctype=ctype)
+    leaf_cells = [c for c in leaf_cells if (c.get("fileType") or "") not in ["作业", "测验", "考试", "讨论", "exam", "homework"]]
+
+    # 全部已完成则重刷(加时长)
+    if not leaf_cells:
+        log(f"[{nickname}] 所有课件已完成,将全部重刷以增加时长...", "INFO")
+        leaf_cells = client.get_course_cells(course_info_id, class_id, course_id, include_completed=True, ctype=ctype)
+        leaf_cells = [c for c in leaf_cells if (c.get("fileType") or "") not in ["作业", "测验", "考试", "讨论", "exam", "homework"]]
+        # 跳过已完成的图片课件(重刷会导致进度回退)
+        _skipped_img = 0
+        _filtered = []
+        for c in leaf_cells:
+            _ct = (c.get("fileType") or "").lower()
+            if _ct in IMAGE_TYPES and c.get("_speed", 0) >= 100:
+                _skipped_img += 1
+                continue
+            _filtered.append(c)
+        leaf_cells = _filtered
+        if _skipped_img > 0:
+            log(f"[{nickname}] 跳过 {_skipped_img} 个已完成的图片课件(避免重刷导致进度回退)", "INFO")
+
+    if not leaf_cells:
+        log(f"[{nickname}] 没有扫描到可刷的进度课件", "INFO")
+        return
+
+    log(f"[{nickname}] 找到 {len(leaf_cells)} 个课件,开始提交心跳...", "INFO")
+    aes_key = client.generate_aes_key() if ctype not in ("MOOC", "RESOURCE") else None
+
+    # 快速模式下并行解析 MP4 时长
+    mp4_duration_cache = {}
+    if not simulate_real:
+        mp4_duration_cache = _parse_mp4_durations_parallel(client, nickname, leaf_cells)
+
+    success_count = 0
+    fail_count = 0
+    consecutive_fails = 0
+
+    for idx, cell in enumerate(leaf_cells):
+        # 连续失败保护
+        if consecutive_fails >= 3:
+            log(f"[{nickname}] ⚠️ 连续3次刷课失败,停止尝试", "WARNING")
+            break
+
+        cell_id = cell.get("id")
+        cell_name = cell.get("name", "?")
+        cell_type = (cell.get("fileType") or "").lower()
+        file_url_raw = cell.get("fileUrl")
+
+        # 计算目标时长
+        total_time = _calculate_total_time(client, nickname, cell, idx, class_id, course_info_id,
+                                            course_id, ctype, cell_type, file_url_raw, mp4_duration_cache)
+
+        # 提交心跳
+        submitted = _submit_heartbeat(client, nickname, cell, idx, len(leaf_cells), class_id, course_info_id,
+                                       course_id, ctype, cell_type, total_time, aes_key, simulate_real)
+
+        if submitted:
+            success_count += 1
+            consecutive_fails = 0
+            log(f"[{nickname}] 刷进度 ✅ [{idx+1}/{len(leaf_cells)}] {cell_name}", "INFO")
+        else:
+            fail_count += 1
+            consecutive_fails += 1
+            # 前3次失败打印 cell 详情,帮助定位特殊课件类型
+            if consecutive_fails <= 3:
+                log(f"[{nickname}] 刷进度 ❌ [{idx+1}/{len(leaf_cells)}] {cell_name} 心跳失败 "
+                    f"(id={cell.get('id','?')}, fileType={cell.get('fileType','?')}, "
+                    f"totalTime={total_time}, _speed={cell.get('_speed','?')})", "WARNING")
+
+        # 快速模式无间隔(原0.02s×385=7.7s纯等待),模拟真实模式保留间隔
+        if simulate_real:
+            time.sleep(0.1)
+
+    log(f"[{nickname}] 🎉 进度秒刷结束:成功 {success_count} 个,失败 {fail_count} 个", "INFO")
+
+    # 刷新进度
+    _refresh_progress(client, ctype, course_info_id, class_id)
+
+
+def _parse_mp4_durations_parallel(client: ZjyClient, nickname: str, leaf_cells: list) -> dict:
+    """并行解析所有视频课件的 MP4 时长。"""
+    mp4_parse_tasks = []
+    for _idx, _cell in enumerate(leaf_cells):
+        _cell_type = (_cell.get("fileType") or "").lower()
+        _file_url_raw = _cell.get("fileUrl")
+        if _cell_type in VIDEO_TYPES and _file_url_raw:
+            mp4_parse_tasks.append((_idx, _cell))
+
+    if not mp4_parse_tasks:
+        return {}
+
+    log(f"[{nickname}] 🔍 并行解析 {len(mp4_parse_tasks)} 个视频时长...", "INFO")
+    cache = {}
+
+    def _parse(task):
+        _i, _c = task
+        try:
+            _ori_url = extract_file_url(_c.get("fileUrl"))
+            if _ori_url:
+                _dur = get_mp4_duration(_ori_url)
+                return (_i, _dur if _dur and _dur > 0 else None)
+        except Exception:
+            pass
+        return (_i, None)
+
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        futures = {executor.submit(_parse, t): t for t in mp4_parse_tasks}
+        for f in as_completed(futures):
+            _i, _dur = f.result()
+            cache[_i] = _dur
+
+    return cache
+
+
+def _calculate_total_time(client: ZjyClient, nickname: str, cell: dict, idx: int,
+                           class_id: str, course_info_id: str, course_id: str,
+                           ctype: str, cell_type: str, file_url_raw, mp4_cache: dict) -> int:
+    """计算课件的目标学习时长(秒)。
+
+    优化:不再对每个课件串行查询 spoc/studyRecord/list(385个课件=385次HTTP请求,极慢)。
+    改为优先用 MP4 时长和 studentStudyRecord,仅在都失败时才惰性查询 studyRecord/list。
+    """
+    total_time = None
+    spoc_record_time = None
+
+    # 从 studentStudyRecord 获取时长(本地数据,无网络请求)
+    record_time = None
+    ssr = cell.get("studentStudyRecord")
+    if isinstance(ssr, dict):
+        for key in ["totalNum", "resourceTotalNum"]:
+            t_num = ssr.get(key)
+            if t_num is not None:
+                try:
+                    if int(t_num) > 0:
+                        record_time = int(t_num)
+                        break
+                except Exception:
+                    pass
+
+    # 知识点讲解类型:通过 getStudyCellInfo 获取视频时长
+    if cell.get("_is_knowledge_explain") and ctype not in ("MOOC", "RESOURCE"):
+        ke_info = client.get_knowledge_explain_video_info(cell.get("id"), class_id)
+        if ke_info:
+            if ke_info.get("totalNum") and ke_info["totalNum"] > 0:
+                record_time = ke_info["totalNum"]
+                spoc_record_time = ke_info["totalNum"]
+            if ke_info.get("fileUrl"):
+                file_url_raw = ke_info["fileUrl"]
+                cell_type = "video"
+        else:
+            log(f"[{nickname}] ⚠️ {cell.get('name', '?')} 知识点讲解详情获取失败,用随机时长", "WARNING")
+
+    # MP4 真实时长(优先级最高)
+    mp4_time = None
+    if cell_type in VIDEO_TYPES and file_url_raw:
+        cached_dur = mp4_cache.get(idx)
+        if cached_dur is not None:
+            mp4_time = cached_dur
+        else:
+            try:
+                ori_url = extract_file_url(file_url_raw)
+                if ori_url:
+                    parsed = get_mp4_duration(ori_url)
+                    if parsed and parsed > 0:
+                        mp4_time = parsed
+                    else:
+                        log(f"[{nickname}] ⚠️ {cell.get('name','?')} MP4时长解析失败,将用随机时长", "WARNING")
+            except Exception as e:
+                log(f"[{nickname}] ⚠️ {cell.get('name','?')} 解析异常: {e},将用随机时长", "WARNING")
+
+    # 时长优先级:MP4真实时长 > 知识点讲解totalNum > 旧记录时长(视频不用旧记录)
+    if mp4_time and mp4_time > 0:
+        total_time = mp4_time
+    elif cell.get("_is_knowledge_explain") and record_time and record_time > 0:
+        total_time = record_time
+    elif record_time and record_time > 0 and cell_type not in VIDEO_TYPES:
+        total_time = record_time
+    elif spoc_record_time and spoc_record_time > 0 and cell_type not in VIDEO_TYPES:
+        total_time = spoc_record_time
+
+    # 惰性查询:仅当以上都未获取到时长时,才查询 spoc/studyRecord/list
+    # (优化:避免对每个课件都发起此请求,385个课件可省去绝大多数HTTP调用)
+    if total_time is None and ctype not in ("MOOC", "RESOURCE"):
+        try:
+            rec_data = client.api_get("spoc/studyRecord/list", {
+                "classId": class_id, "courseInfoId": course_info_id,
+                "sourceId": cell.get("id"), "pageNum": "1", "pageSize": "5",
+            })
+            if rec_data:
+                rows = client.extract_rows(rec_data)
+                for r in rows:
+                    tn = r.get("totalNum") or r.get("resourceTotalNum")
+                    if tn is not None:
+                        try:
+                            tn = int(tn)
+                            if tn > 0:
+                                total_time = tn
+                                break
+                        except Exception:
+                            pass
+        except Exception:
+            pass
+
+    # 随机时长兜底
+    if total_time is None:
+        total_time = _random_duration(cell_type)
+
+    # 最短时长约束
+    if total_time < 60 and cell_type not in IMAGE_TYPES:
+        total_time = random.randint(60, 180)
+    # MOOC 最短 1200 秒(20分钟)
+    if ctype == "MOOC" and total_time < 1200 and cell_type not in IMAGE_TYPES:
+        total_time = random.randint(1200, 2400)
+    # 图片类型确保有合理浏览时长
+    if cell_type in IMAGE_TYPES and total_time < 30:
+        total_time = random.randint(30, 60)
+
+    return total_time
+
+
+def _random_duration(cell_type: str) -> int:
+    """根据课件类型生成随机时长。"""
+    if cell_type in IMAGE_TYPES:
+        return random.randint(5, 15)
+    if cell_type in ["pdf", "ppt", "word", "excel", "doc", "文档", "图文"]:
+        return random.randint(300, 600)
+    if cell_type in VIDEO_TYPES:
+        return random.randint(600, 1800)
+    return random.randint(300, 900)
+
+
+def _submit_heartbeat(client: ZjyClient, nickname: str, cell: dict, idx: int, total: int,
+                      class_id: str, course_info_id: str, course_id: str,
+                      ctype: str, cell_type: str, total_time: int,
+                      aes_key: Optional[str], simulate_real: bool) -> bool:
+    """提交心跳包,根据课程类型走不同分支。"""
+    if ctype == "MOOC":
+        return _submit_mooc_heartbeat(client, nickname, cell, idx, total, class_id, course_info_id,
+                                       course_id, cell_type, total_time, simulate_real)
+    elif ctype == "RESOURCE":
+        return _submit_resource_heartbeat(client, nickname, cell, course_info_id,
+                                           course_id, cell_type, total_time)
+    else:
+        return _submit_spoc_heartbeat(client, nickname, cell, class_id, course_info_id,
+                                      course_id, cell_type, total_time, aes_key, simulate_real)
+
+
+def _submit_mooc_heartbeat(client: ZjyClient, nickname: str, cell: dict, idx: int, total: int,
+                            class_id: str, course_info_id: str, course_id: str,
+                            cell_type: str, total_time: int, simulate_real: bool) -> bool:
+    """MOOC 心跳提交:6个API探测 → 并发/模拟真实提交。"""
+    cell_id = cell.get("id")
+    is_image = cell_type in IMAGE_TYPES
+
+    if is_image:
+        _img_count = 1
+        mooc_record = {
+            "actualNum": _img_count, "courseId": course_id, "courseInfoId": course_info_id,
+            "id": str(uuid.uuid4()).upper(), "lastNum": _img_count, "params": {},
+            "resourceTotalNum": _img_count, "sourceId": cell_id, "speed": 100.0,
+            "studentId": client.stu_id, "studyDuration": total_time, "totalNum": _img_count,
+        }
+    else:
+        mooc_record = {
+            "actualNum": total_time, "courseId": course_id, "courseInfoId": course_info_id,
+            "id": str(uuid.uuid4()).upper(), "lastNum": total_time, "params": {},
+            "resourceTotalNum": total_time, "sourceId": cell_id, "speed": 100.0,
+            "studentId": client.stu_id, "studyDuration": total_time, "totalNum": total_time,
+        }
+    if class_id:
+        mooc_record["classId"] = class_id
+
+    # 心跳次数 = total_time // 5(每5秒一次),最多600次
+    heartbeat_interval = 5
+    heartbeat_count = min(total_time // heartbeat_interval, 600)
+    if is_image:
+        heartbeat_count = min(heartbeat_count, 5)
+
+    # 探测可用 API
+    working_api = _probe_mooc_api(client, mooc_record, heartbeat_interval)
+    if not working_api:
+        log(f"[{nickname}] 刷进度 ❌ [{idx+1}/{total}] {cell.get('name','?')} MOOC提交全部失败(无可用API)", "WARNING")
+        return False
+
+    method, api_path, use_ai = working_api
+
+    if simulate_real:
+        return _mooc_simulate_real(client, mooc_record, heartbeat_count, total_time,
+                                    heartbeat_interval, is_image, method, api_path, use_ai)
+    else:
+        return _mooc_fast_concurrent(client, mooc_record, heartbeat_count, total_time,
+                                      is_image, method, api_path, use_ai)
+
+
+def _probe_mooc_api(client: ZjyClient, mooc_record: dict, heartbeat_interval: int):
+    """探测 MOOC 可用的心跳提交 API。"""
+    mooc_submit_apis = [
+        ("POST", "course/studyRecord", True),
+        ("PUT", "course/studyRecord", True),
+        ("POST", "course/mooc/studyRecord", True),
+        ("PUT", "course/mooc/studyRecord", True),
+        ("POST", "spoc/course/mooc/studyRecord", False),
+        ("PUT", "spoc/course/mooc/studyRecord", False),
+    ]
+    for method, api_path, use_ai in mooc_submit_apis:
+        test_record = dict(mooc_record)
+        test_record["studyDuration"] = heartbeat_interval
+        test_record["actualNum"] = heartbeat_interval
+        test_record["lastNum"] = heartbeat_interval
+        try:
+            if use_ai:
+                if method == "PUT":
+                    result = client.api_put_ai(api_path, test_record)
+                else:
+                    result = client.api_post_ai(api_path, test_record)
+            else:
+                if method == "PUT":
+                    result = client.api_put(api_path, test_record)
+                else:
+                    result = client.api_post(api_path, test_record)
+            if result and result.get("code") == 200:
+                return (method, api_path, use_ai)
+        except Exception:
+            continue
+    return None
+
+
+def _mooc_simulate_real(client: ZjyClient, mooc_record: dict, heartbeat_count: int,
+                         total_time: int, heartbeat_interval: int, is_image: bool,
+                         method: str, api_path: str, use_ai: bool) -> bool:
+    """MOOC 模拟真实模式:逐条发送,间隔5-8秒。"""
+    ok_count = 0
+    for hb_idx in range(heartbeat_count):
+        hb_record = dict(mooc_record)
+        hb_record["id"] = str(uuid.uuid4()).upper()
+        _progress_num = 1 if is_image else total_time
+        if hb_idx == heartbeat_count - 1:
+            hb_record["studyDuration"] = total_time
+            hb_record["actualNum"] = _progress_num
+            hb_record["lastNum"] = _progress_num
+        else:
+            hb_record["studyDuration"] = (hb_idx + 1) * heartbeat_interval
+            _hb_progress = 1 if is_image else (hb_idx + 1) * heartbeat_interval
+            hb_record["actualNum"] = _hb_progress
+            hb_record["lastNum"] = _hb_progress
+        try:
+            if use_ai:
+                if method == "PUT":
+                    r = client.api_put_ai(api_path, hb_record)
+                else:
+                    r = client.api_post_ai(api_path, hb_record)
+            else:
+                if method == "PUT":
+                    r = client.api_put(api_path, hb_record)
+                else:
+                    r = client.api_post(api_path, hb_record)
+            if r and r.get("code") == 200:
+                ok_count += 1
+            else:
+                break
+        except Exception:
+            break
+        if hb_idx < heartbeat_count - 1:
+            time.sleep(random.uniform(5, 8))
+    return ok_count > 0
+
+
+def _mooc_fast_concurrent(client: ZjyClient, mooc_record: dict, heartbeat_count: int,
+                           total_time: int, is_image: bool,
+                           method: str, api_path: str, use_ai: bool) -> bool:
+    """MOOC 快速模式:并发提交全部心跳包。"""
+    payloads = []
+    _progress_num = 1 if is_image else total_time
+    for _ in range(heartbeat_count):
+        hb = dict(mooc_record)
+        hb["id"] = str(uuid.uuid4()).upper()
+        hb["studyDuration"] = total_time
+        hb["actualNum"] = _progress_num
+        hb["lastNum"] = _progress_num
+        payloads.append(hb)
+
+    def _submit(p):
+        try:
+            if use_ai:
+                if method == "PUT":
+                    return client.api_put_ai(api_path, p)
+                return client.api_post_ai(api_path, p)
+            else:
+                if method == "PUT":
+                    return client.api_put(api_path, p)
+                return client.api_post(api_path, p)
+        except Exception:
+            return None
+
+    ok_count = 0
+    _batch_size = 100
+    for _batch_start in range(0, len(payloads), _batch_size):
+        _batch = payloads[_batch_start:_batch_start + _batch_size]
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            futures = {executor.submit(_submit, p): p for p in _batch}
+            for f in as_completed(futures):
+                try:
+                    r = f.result()
+                    if r and r.get("code") == 200:
+                        ok_count += 1
+                except Exception:
+                    pass
+
+    # 全部失败时并发重试前30条(对齐商业版)
+    if ok_count == 0:
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            futures = {executor.submit(_submit, p): p for p in payloads[:30]}
+            for f in as_completed(futures):
+                try:
+                    r = f.result()
+                    if r and r.get("code") == 200:
+                        ok_count += 1
+                except Exception:
+                    pass
+
+    return ok_count > 0
+
+
+def _submit_resource_heartbeat(client: ZjyClient, nickname: str, cell: dict,
+                                course_info_id: str, course_id: str,
+                                cell_type: str, total_time: int) -> bool:
+    """资源库心跳提交:zyk 域明文 JSON,URL 末尾斜杠必需。"""
+    cell_id = cell.get("id")
+    is_image = cell_type in IMAGE_TYPES
+    cell_parent_id = cell.get("parentId", "") or ""
+
+    hb_count = max(1, total_time // 10)
+    hb_count = min(hb_count, 200)
+    if is_image:
+        hb_count = min(hb_count, 5)
+
+    ok_count = 0
+    for _ in range(hb_count):
+        try:
+            r = client.zyk_submit_heartbeat(
+                course_id, course_info_id, cell_id,
+                total_time, total_time,
+                parent_id=cell_parent_id,
+                student_id=client.stu_id,
+                is_image=is_image,
+            )
+            if r and (r.get("code") == 200 or r.get("code") == 0):
+                ok_count += 1
+        except Exception:
+            pass
+
+    if ok_count == 0:
+        # 重试一次
+        try:
+            r = client.zyk_submit_heartbeat(
+                course_id, course_info_id, cell_id,
+                total_time, total_time,
+                parent_id=cell_parent_id,
+                student_id=client.stu_id,
+                is_image=is_image,
+            )
+            if r and (r.get("code") == 200 or r.get("code") == 0):
+                ok_count += 1
+        except Exception:
+            pass
+
+    return ok_count > 0
+
+
+def _submit_spoc_heartbeat(client: ZjyClient, nickname: str, cell: dict,
+                            class_id: str, course_info_id: str, course_id: str,
+                            cell_type: str, total_time: int,
+                            aes_key: Optional[str], simulate_real: bool) -> bool:
+    """SPOC 心跳提交:AES-128-ECB 加密,服务器每次+5秒。"""
+    if not aes_key:
+        log(f"[{nickname}] SPOC 刷课失败: AES 密钥为空(token缺失)", "ERROR")
+        return False
+
+    cell_id = cell.get("id")
+    is_image = cell_type in IMAGE_TYPES
+
+    if is_image:
+        hb_count = 5
+        _img_count = 1
+        record_proto = {
+            "actualNum": _img_count, "classId": class_id, "courseInfoId": course_info_id,
+            "id": "", "lastNum": _img_count, "params": {},
+            "resourceTotalNum": _img_count, "sourceId": cell_id, "speed": 100.0,
+            "studentId": client.stu_id, "studyTime": total_time, "totalNum": _img_count,
+        }
+    else:
+        hb_count = min(max(1, total_time), 2000)
+        record_proto = {
+            "actualNum": total_time, "classId": class_id, "courseInfoId": course_info_id,
+            "id": "", "lastNum": total_time, "params": {},
+            "resourceTotalNum": total_time, "sourceId": cell_id, "speed": 100.0,
+            "studentId": client.stu_id, "studyTime": total_time, "totalNum": total_time,
+        }
+
+    if simulate_real:
+        return _spoc_simulate_real(client, record_proto, hb_count, total_time,
+                                    is_image, aes_key)
+    else:
+        return _spoc_fast_concurrent(client, record_proto, hb_count, total_time,
+                                      is_image, aes_key)
+
+
+def _spoc_simulate_real(client: ZjyClient, record_proto: dict, hb_count: int,
+                         total_time: int, is_image: bool, aes_key: str) -> bool:
+    """SPOC 模拟真实模式:逐条发送,间隔8-15秒。"""
+    ok_count = 0
+    for hb_idx in range(hb_count):
+        hb = dict(record_proto)
+        hb["id"] = str(uuid.uuid4()).upper()
+        _progress_num = 1 if is_image else total_time
+        if hb_idx == hb_count - 1:
+            hb["studyTime"] = total_time
+        else:
+            hb["studyTime"] = (hb_idx + 1) * 10
+        hb["actualNum"] = _progress_num
+        hb["lastNum"] = _progress_num
+
+        json_str = json.dumps(hb, separators=(',', ':'), sort_keys=True)
+        encrypted = client.aes_encrypt(json_str, aes_key)
+        if not encrypted:
+            break
+        safe_enc = encrypted.replace('%', '%25').replace('+', '%2B')
+        try:
+            _r = client.session.post(f"{BASE_URL}/spoc/studyRecord",
+                                     json={"param": safe_enc}, timeout=15)
+            r = _r.json() if _r.status_code == 200 else None
+            if r and r.get("code") == 200:
+                ok_count += 1
+            else:
+                break
+        except Exception:
+            break
+        if hb_idx < hb_count - 1:
+            time.sleep(random.uniform(8, 15))
+    return ok_count > 0
+
+
+def _spoc_fast_concurrent(client: ZjyClient, record_proto: dict, hb_count: int,
+                           total_time: int, is_image: bool, aes_key: str) -> bool:
+    """SPOC 快速模式:高并发批量提交(服务器每次+5秒)。"""
+    _progress_num = 1 if is_image else total_time
+    payloads = []
+    for _ in range(hb_count):
+        hb = dict(record_proto)
+        hb["id"] = str(uuid.uuid4()).upper()
+        hb["studyTime"] = total_time
+        hb["actualNum"] = _progress_num
+        hb["lastNum"] = _progress_num
+        json_str = json.dumps(hb, separators=(',', ':'), sort_keys=True)
+        encrypted = client.aes_encrypt(json_str, aes_key)
+        if encrypted:
+            safe_enc = encrypted.replace('%', '%25').replace('+', '%2B')
+            payloads.append({"param": safe_enc})
+
+    if not payloads:
+        return False
+
+    def _submit(p):
+        try:
+            _r = client.session.post(f"{BASE_URL}/spoc/studyRecord", json=p, timeout=15)
+            if _r.status_code == 200:
+                return _r.json()
+        except Exception:
+            pass
+        return None
+
+    ok_count = 0
+    _batch_size = 100
+    for _batch_start in range(0, len(payloads), _batch_size):
+        _batch = payloads[_batch_start:_batch_start + _batch_size]
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            futures = {executor.submit(_submit, p): p for p in _batch}
+            for f in as_completed(futures):
+                try:
+                    r = f.result()
+                    if r and r.get("code") == 200:
+                        ok_count += 1
+                except Exception:
+                    pass
+
+    # 全部失败时重试前10条,并打印诊断日志
+    if ok_count == 0:
+        # 诊断:打印第一条 payload 的实际响应,定位失败原因
+        if payloads:
+            try:
+                _diag_r = _submit(payloads[0])
+                if _diag_r:
+                    log(f"[{nickname}] [诊断] SPOC心跳响应: code={_diag_r.get('code')}, msg={str(_diag_r.get('msg',''))[:200]}", "WARNING")
+                else:
+                    log(f"[{nickname}] [诊断] SPOC心跳无响应(可能token过期或网络异常)", "WARNING")
+            except Exception as _e:
+                log(f"[{nickname}] [诊断] SPOC心跳请求异常: {_e}", "WARNING")
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            futures = {executor.submit(_submit, p): p for p in payloads[:10]}
+            for f in as_completed(futures):
+                try:
+                    r = f.result()
+                    if r and r.get("code") == 200:
+                        ok_count += 1
+                except Exception:
+                    pass
+
+    return ok_count > 0
+
+
+def _refresh_progress(client: ZjyClient, ctype: str, course_info_id: str, class_id: str) -> None:
+    """刷课后刷新进度。"""
+    if ctype == "MOOC":
+        client.api_get_ai("spoc/mooc/course/study/refresh", {"courseInfoId": course_info_id})
+    elif ctype == "RESOURCE":
+        client.zyk_refresh_progress(course_info_id)
+    else:
+        client.api_get("spoc/fast/course/study/refresh", {"courseInfoId": course_info_id, "classId": class_id})
+
+
+# ==================== Part 1.5: 自动答题 ====================
+
+def _brush_exam(client: ZjyClient, nickname: str, class_id: str,
+                course_info_id: str, course_id: str, ctype: str) -> None:
+    """自动答题:扫描课程下所有未提交/低分的作业/考试/测验并自动完成。
+
+    答案数据源优先级:
+    - 资源库:zyk_get_homework_answers(直接抓取服务端标准答案)
+    - SPOC/MOOC:find_classmate_answers(学生号直取/同学扫包) + 教师号预览 + 题库兜底
+    """
+    from answer import get_course_exams_list, _is_low_score, do_auto_answer_single_exam
+
+    log(f"[{nickname}] 🚀 开始自动答题...", "INFO")
+    try:
+        exams = get_course_exams_list(client, class_id, course_info_id, course_id, ctype)
+        unsubmitted_exams = [e for e in exams if _is_low_score(e)]
+
+        if not unsubmitted_exams:
+            log(f"[{nickname}] 没有发现未提交或低分的作业或考试", "INFO")
+            return
+
+        log(f"[{nickname}] 发现 {len(unsubmitted_exams)} 个未提交的作业/考试,开始逐一答题...", "INFO")
+        exam_success = 0
+        exam_fail = 0
+        for exam in unsubmitted_exams:
+            exam_id = exam.get("id") or exam.get("examId")
+            title = exam.get("title", "未命名任务")
+            etype = exam.get("type", "")
+            category_id = "2" if etype == "考试" else ("3" if etype == "测验" else "1")
+            ok, msg = do_auto_answer_single_exam(
+                client, nickname, exam_id, class_id, course_info_id, course_id, ctype, title, category_id
+            )
+            if ok:
+                exam_success += 1
+            else:
+                exam_fail += 1
+            time.sleep(1)
+        log(f"[{nickname}] 🎉 自动答题结束:成功 {exam_success} 个,失败 {exam_fail} 个", "INFO")
+    except Exception as e:
+        log(f"[{nickname}] 自动答题环节异常: {e}", "ERROR")
+
+
+# ==================== Part 2: 刷讨论 ====================
+
+def _brush_discussion(client: ZjyClient, nickname: str, class_id: str,
+                       course_info_id: str, course_id: str, ctype: str) -> None:
+    """自动回复讨论:课堂活动/MOOC板块/课件讨论三分支。"""
+    log(f"[{nickname}] 🚀 开始自动回复讨论...", "INFO")
+    discuss_count = 0
+
+    # 2.1 课堂活动讨论(仅 SPOC)
+    if class_id and ctype == "SPOC":
+        discuss_count += _brush_classroom_discussion(client, nickname, class_id, course_info_id, course_id)
+
+    # 2.2 MOOC 板块讨论
+    elif ctype == "MOOC":
+        discuss_count += _brush_mooc_discussion(client, nickname, course_info_id, course_id)
+
+    # 2.3 课件讨论(SPOC/NZYK)
+    if ctype not in ("MOOC", "RESOURCE"):
+        discuss_count += _brush_courseware_discussion(client, nickname, class_id, course_info_id, course_id, ctype)
+
+    log(f"[{nickname}] 🎉 讨论回复结束:共成功回复 {discuss_count} 个讨论", "INFO")
+
+
+def _brush_classroom_discussion(client: ZjyClient, nickname: str, class_id: str,
+                                 course_info_id: str, course_id: str) -> int:
+    """扫描并回复课堂活动讨论。"""
+    log(f"[{nickname}] 💬 正在扫描随堂活动讨论...", "INFO")
+    count = 0
+    for req_type in ["1", "2", "3"]:
+        params = {
+            "classId": class_id, "courseInfoId": course_info_id, "courseId": course_id,
+            "pageNum": "1", "pageSize": "9999", "teachType": "0", "type": "0", "requireType": req_type,
+        }
+        data = client.api_get("spoc/courseFaceTeachActivity/getCurrentActivityList", params)
+        activities = client.extract_rows(data)
+        for act in activities:
+            atype = act.get("activityType") or act.get("activityTypeId")
+            if str(atype) == "4":
+                discuss_id = act.get("activityId") or act.get("id") or ""
+                teach_id = act.get("teachId", "")
+                title = act.get("title", "课堂讨论")
+                payload = {
+                    "classId": class_id, "courseId": course_id, "courseInfoId": course_info_id,
+                    "discussId": discuss_id, "parentId": "0", "requireType": req_type,
+                    "teachId": teach_id, "content": random.choice(DISCUSS_CONTENTS),
+                    "fileUrl": None, "id": None,
+                }
+                res = client.api_post("spoc/courseFaceTeachDiscussStudent/", payload)
+                if res and res.get("code") == 200:
+                    count += 1
+                    log(f"[{nickname}] 💬 回复课堂讨论 ✅ {title}", "INFO")
+                time.sleep(0.3)
+    return count
+
+
+def _brush_mooc_discussion(client: ZjyClient, nickname: str,
+                            course_info_id: str, course_id: str) -> int:
+    """扫描并回复 MOOC 板块讨论。"""
+    log(f"[{nickname}] 💬 正在扫描MOOC活动讨论...", "INFO")
+    count = 0
+    page = 1
+    all_discuss = []
+    while True:
+        data = client.api_get_ai("course/courseInfoDiscuss/list", {
+            "courseId": course_id, "courseInfoId": course_info_id,
+            "pageNum": str(page), "pageSize": "20", "discussType": "4",
+            "queryUser": "2", "keyword": "",
+        })
+        rows = client.extract_rows(data) or []
+        if not rows:
+            break
+        all_discuss.extend(rows)
+        total = data.get("total") if isinstance(data, dict) else 0
+        if len(all_discuss) >= total or len(rows) < 20:
+            break
+        page += 1
+
+    for d in all_discuss:
+        discuss_id = d.get("id", "")
+        d_title = d.get("title", "讨论")
+
+        # 检查是否已回复
+        reply_data = client.api_get_ai("course/courseInfoReply/list", {
+            "courseId": course_id, "courseInfoId": course_info_id,
+            "discussId": discuss_id, "replyId": "0", "typeId": "1",
+            "pageNum": "1", "pageSize": "10", "type": "0",
+        })
+        already_replied = False
+        classmate_contents = []
+        if reply_data and isinstance(reply_data, dict):
+            records = reply_data.get("records") or []
+            for rec in records:
+                if str(rec.get("userId", "")) == str(client.stu_id):
+                    already_replied = True
+                else:
+                    c_text = rec.get("content", "").replace("<p>", "").replace("</p>", "").strip()
+                    if c_text and len(c_text) > 5:
+                        classmate_contents.append(c_text)
+
+        if already_replied:
+            continue
+
+        reply_text = random.choice(classmate_contents) if classmate_contents else random.choice(DISCUSS_CONTENTS)
+        reply_payload = {
+            "courseId": course_id, "courseInfoId": course_info_id,
+            "discussId": discuss_id, "content": f"<p>{reply_text}</p>", "typeId": 1,
+        }
+        res = client.api_post_ai("course/courseInfoReply/add", reply_payload)
+        if res and res.get("code") == 200:
+            count += 1
+            log(f"[{nickname}] 💬 回复MOOC讨论 ✅ {d_title}", "INFO")
+        time.sleep(0.3)
+    return count
+
+
+def _brush_courseware_discussion(client: ZjyClient, nickname: str, class_id: str,
+                                  course_info_id: str, course_id: str, ctype: str) -> int:
+    """扫描并回复课件讨论。"""
+    log(f"[{nickname}] 💬 正在扫描并回复课件讨论...", "INFO")
+    count = 0
+    leaf_cells = client.get_course_cells(course_info_id, class_id, course_id, include_completed=True, ctype=ctype)
+
+    discuss_apis = ["spoc/courseInfoDiscuss/"]
+    if ctype == "NZYK":
+        discuss_apis += ["spoc/nzyk/courseInfoDiscuss/", "spoc/resource/courseInfoDiscuss/"]
+
+    for idx, cell in enumerate(leaf_cells):
+        cell_id = cell.get("id", "")
+        payload = {
+            "discussType": "1", "star": 5, "title": random.choice(DISCUSS_TITLES),
+            "content": random.choice(DISCUSS_CONTENTS), "typeId": 1, "classId": class_id,
+            "courseId": course_id, "courseInfoId": course_info_id, "courseDesignId": cell_id,
+        }
+        posted = False
+        for api_path in discuss_apis:
+            res = client.api_post(api_path, payload)
+            if res and res.get("code") == 200:
+                count += 1
+                posted = True
+                break
+            elif res and ("classId" in str(res.get("msg", "")) or "不存在" in str(res.get("msg", ""))):
+                continue
+            else:
+                break
+
+        if posted and (count % 10 == 0 or idx == len(leaf_cells) - 1):
+            log(f"[{nickname}] 💬 课件讨论回复中...(当前已累计回复 {count} 个讨论)", "INFO")
+        time.sleep(0.1)
+    return count
