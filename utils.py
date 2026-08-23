@@ -51,6 +51,7 @@ def print_banner() -> None:
         f"        ICVE_Toolkit v{APP_VERSION}\n"
         "        SPOC / MOOC / 资源库刷课 + 签到改签\n"
         "        协议: PolyForm Noncommercial 1.0.0 (禁止商用)\n"
+        "        收费代刷、引流变现均属商用,禁止\n"
         + "=" * 52
     )
     print(banner, flush=True)
