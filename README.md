@@ -2,7 +2,7 @@
 
 [![Python](https://img.shields.io/badge/Python-3.8%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20macOS%20%7C%20Linux-555?logo=windows&logoColor=white)](#快速开始)
-[![License](https://img.shields.io/badge/License-CC%20BY--NC--SA%204.0-EF9421?logo=creativecommons&logoColor=white)](./LICENSE)
+[![License](https://img.shields.io/badge/License-PolyForm--NC--1.0.0-EF9421)](./LICENSE)
 [![Release](https://img.shields.io/github/v/release/atvkh/ICVE_Toolkit?logo=github&color=2EA44F)](https://github.com/atvkh/ICVE_Toolkit/releases/latest)
 [![Stars](https://img.shields.io/github/stars/atvkh/ICVE_Toolkit?style=flat&logo=github&color=yellow)](https://github.com/atvkh/ICVE_Toolkit/stargazers)
 [![Forks](https://img.shields.io/github/forks/atvkh/ICVE_Toolkit?style=flat&logo=github&color=blue)](https://github.com/atvkh/ICVE_Toolkit/forks)
@@ -12,7 +12,7 @@
 
 > ## 🚫 严禁商用声明
 >
-> **本项目采用 [CC BY-NC-SA 4.0](./LICENSE)（署名-非商业性使用-相同方式共享）协议发布，禁止任何形式的商业使用。**
+> **本项目采用 [PolyForm Noncommercial 1.0.0](./LICENSE)（非商业性使用许可）协议发布，仅供非商业目的使用，禁止任何形式的商业使用。**
 >
 > 未经作者书面授权，**禁止**将本项目原创的代码、文档、教程内容及配套资源（含但不限于本 README、各功能模块源码及 docs/ 下的内容）用于：付费售卖、付费解锁、接入收费平台、捆绑推广或其他任何以营利为目的的用途。
 >
@@ -183,7 +183,7 @@ ICVE_Toolkit/
 ├── utils.py             # 日志/格式化工具
 ├── requirements.txt     # 依赖(requests + pycryptodome)
 ├── start.bat            # Windows 一键启动
-├── LICENSE              # CC BY-NC-SA 4.0
+├── LICENSE              # PolyForm Noncommercial 1.0.0
 └── docs/                # 证据图片
 ```
 
@@ -221,11 +221,11 @@ MOOC/SPOC: 学生号直取 > 教师号预览 > 同学正确答案 > 题库兜底
 
 ## 开源协议
 
-**CC BY-NC-SA 4.0**(署名-非商业性使用-相同方式共享 4.0 国际)
+**PolyForm Noncommercial 1.0.0**(非商业性使用许可)
 
-- ✅ 允许:分享、改编、二次开发
-- ❌ 禁止:商业使用(销售、付费服务、内部商业工具等)
-- 📋 要求:署名原作者 + 衍生作品采用相同协议
+- ✅ 允许:个人学习研究、修改、二次开发、非商业性分发
+- ❌ 禁止:商业使用(销售、付费服务、内部商业工具等一切以营利为目的的用途)
+- 📋 要求:分发时须附带本协议条款或其链接(Notices 条款)
 
 详见 [LICENSE](LICENSE)。
 

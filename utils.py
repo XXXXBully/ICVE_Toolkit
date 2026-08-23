@@ -41,13 +41,16 @@ def _supports_ansi() -> bool:
         return False
 
 
+APP_VERSION = "1.1.0"
+
+
 def print_banner() -> None:
     """打印程序启动横幅。"""
     banner = (
         "\n" + "=" * 52 + "\n"
-        "        ICVE_Toolkit\n"
+        f"        ICVE_Toolkit v{APP_VERSION}\n"
         "        SPOC / MOOC / 资源库刷课 + 签到改签\n"
-        "        协议: CC BY-NC-SA 4.0 (禁止商用)\n"
+        "        协议: PolyForm Noncommercial 1.0.0 (禁止商用)\n"
         + "=" * 52
     )
     print(banner, flush=True)
