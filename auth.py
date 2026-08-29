@@ -1,11 +1,11 @@
-"""登录模块:浏览器手动登录 + 本地 HTTPServer 回调 token。
+"""登录模块:全自动滑块登录(账密 → 自动过阿里云滑块)+ 人工回调兜底。
 
-复用 icve_speed_course 的登录方案:
-1. 启动本地 HTTPServer(127.0.0.1:9527)
-2. 终端打印 SSO 登录链接,用户在浏览器打开
-3. 用户手动完成账密 + 验证码登录
-4. SSO 重定向到本地服务,捕获 URL 中的 token 参数
-5. 用 token 换 bearer_token → apply_token 拉用户信息 → 入库
+登录新账号的流程:
+1. 终端输入账密 → slider_auto 全自动过阿里云滑块 → 拦截 userLoginV2 响应拿 sso_token
+2. 用 sso_token 换 bearer_token → apply_token 拉用户信息 → 入库
+3. 自动登录 2 次全失败 → 回退人工流程(原生 9527 回调,原样保留):
+   启动本地 HTTPServer(127.0.0.1:9527),打印 SSO 链接由用户在浏览器手动登录,
+   SSO 重定向回调带 token 参数,再走同样的换 token 流程
 """
 
 import webbrowser
@@ -55,11 +55,11 @@ class CallbackHandler(BaseHTTPRequestHandler):
 
 
 def login() -> Optional[ZjyClient]:
-    """启动 HTTPServer 等待浏览器回调,返回已认证的 ZjyClient。
+    """登录入口,返回已认证的 ZjyClient。
 
     流程:
     1. 若有已保存账号,先尝试用保存的 token 复用登录
-    2. 无可用保存账号时,启动浏览器登录流程
+    2. 无可用保存账号时,登录新账号(自动滑块优先,人工回调兜底)
 
     :return: ZjyClient 实例或 None(登录失败/超时)
     """
@@ -124,11 +124,83 @@ def _try_saved_accounts() -> Optional[ZjyClient]:
     return None
 
 
+def _input_password() -> str:
+    """读密码:明文回显(本地 CLI 工具,输入可见便于确认)。"""
+    return input("  密码: ").strip()
+
+
+def _prompt_credentials() -> Optional[tuple]:
+    """终端输入账密;账号留空表示跳过自动登录,直接走人工流程。
+
+    :return: (user, pwd) 或 None
+    """
+    print("\n  正在后台准备自动登录环境(浏览器窗口已隐藏,无需理会),请输入账密:", flush=True)
+    user = input("  账号(直接回车 = 改用浏览器人工登录): ").strip()
+    if not user:
+        return None
+    pwd = _input_password()
+    if not pwd:
+        log("  密码为空,跳过自动登录", "WARNING")
+        return None
+    return user, pwd
+
+
+def _auto_slider_login() -> Optional[str]:
+    """全自动滑块登录(自动尝试 2 次),返回 sso_token 或 None。
+
+    先检测依赖:缺失时询问自动安装,装不上直接转人工,不让用户白输账密。
+    依赖就绪后启动后台预热(隐藏的浏览器加载自建登录页并预弹滑块),
+    再让用户在 CLI 输账密——预热与输账密并行,输完回车约 2-4 秒完成登录。
+    """
+    try:
+        import slider_auto
+        from slider_auto import AutoSlider
+    except Exception as e:
+        log(f"  自动登录模块不可用({e}),转入人工登录", "WARNING")
+        return None
+    # 依赖关前置:缺依赖时先问是否自动安装,避免用户输完账密才被告知装不了
+    if not slider_auto.deps_ready():
+        missing = slider_auto.missing_packages()
+        log(f"  [自动登录] 缺少依赖: {' '.join(missing)}", "WARNING")
+        ans = input("  是否自动安装缺失依赖(需联网,含浏览器内核约 300MB)? [Y/n]: ").strip().lower()
+        if ans not in ('', 'y', 'yes'):
+            log("  跳过自动安装,转入人工登录", "INFO")
+            return None
+        if not slider_auto.auto_install_deps():
+            log("  依赖安装失败,转入人工登录", "WARNING")
+            return None
+        log("  依赖安装完成", "SUCCESS")
+    sess = AutoSlider()
+    sess.start()
+    try:
+        creds = _prompt_credentials()
+        if not creds:
+            return None
+        try:
+            return sess.obtain_sso_token(*creds, max_attempts=2)
+        except Exception as e:
+            log(f"  自动登录异常: {e}", "ERROR")
+            return None
+    finally:
+        sess.close()
+
+
 def _browser_login() -> Optional[ZjyClient]:
-    """启动浏览器登录流程:HTTPServer 等待回调。"""
+    """登录新账号:先全自动滑块登录,失败回退 9527 人工回调流程。"""
     global _captured_token
     _captured_token = None
 
+    # 步骤1:全自动滑块登录(账密 → 自动过滑块 → sso_token → bearer_token)
+    sso_token = _auto_slider_login()
+    if sso_token:
+        client = _exchange_token(sso_token)
+        if client:
+            return client
+        log("  自动登录换取 Token 失败,转入人工登录", "WARNING")
+    else:
+        log("  自动滑块登录未成功,转入人工登录(浏览器回调)", "WARNING")
+
+    # 步骤2:人工兜底 —— 原生 9527 回调流程原样保留
     sso_url = f"{SSO_BASE}/h5/?mode=simple&source=15&redirect={CALLBACK_URL}#/login"
     log(f"\n  请在浏览器中打开以下链接登录:", "INFO")
     print(f"  {sso_url}\n", flush=True)

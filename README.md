@@ -28,6 +28,7 @@
 
 - [盗用事件](#盗用事件)
 - [功能简介](#功能简介)
+- [登录流程](#登录流程)
 - [补签与改签](#补签与改签)
 - [快速开始](#快速开始)
 - [项目结构](#项目结构)
@@ -124,11 +125,45 @@
 
 ### 登录方式
 
-浏览器手动登录 + 本地回调 Token:
-1. CLI 启动本地 HTTP 服务(127.0.0.1:9527)
-2. 浏览器打开 SSO 登录链接，手动完成验证码登录
-3. 登录成功后自动回调，捕获 Token 完成认证
-4. 账号信息持久化到 accounts.json
+全自动滑块登录(默认),零人工输入验证码;失败自动逐级降级到人工登录。完整机制见下方[登录流程](#登录流程)专章。
+
+---
+
+## 登录流程
+
+选择菜单 `[1] 登录` 后,按以下优先级自动进行:
+
+### 1. 已保存账号复用(优先)
+
+- 展示 `accounts.json` 中的历史账号,选择后直接用本地 Token 登录,**不输密码、不过滑块**
+- Token 过期时自动用 SSO Token 无感刷新并回写入库;两者均失效才需重新登录(自动清理解约账号)
+- 选 `[0] 登录新账号` 进入下方新账号流程
+
+### 2. 全自动滑块登录(新账号默认)
+
+**前置:依赖检测**
+- 启动前先检测滑块登录依赖(`playwright` / `opencv-python` / `numpy` / `scipy` / `pillow`)
+- 缺失时询问一键自动安装(含 Chromium 浏览器内核,约 300MB,需联网),装不上直接转人工,不浪费输账密
+- 打包后的 exe 无 pip,请提前按[快速开始](#快速开始)准备好环境或直接用源码运行模式
+
+**流程(回车后约 2~4 秒)**:
+1. 选择登录新账号时,后台立即预热:隐藏的 Chromium(屏幕外窗口,不干扰使用)加载内置极简登录页并预先弹出滑块——与你在终端输账密并行,零等待;终端焦点被抢时会自动抢回,无需重新点击面板
+2. 终端输入账号密码回车:账密注入 → 双证据融合(白帽变换 + Canny 边缘)识别缺口 → 真人形态轨迹拖拽(鼠标热身 + 50-70Hz 采样 + 闭环校正)过阿里云滑块 → 拦截登录响应拿 SSO Token
+3. SSO Token 自动换取 Bearer Token → 拉取用户信息 → 账号持久化到 `accounts.json`
+
+### 3. 失败自动降级链(无需干预)
+
+```
+自建极简登录页(2 次尝试,失败间隔 2s 退避防风控)
+    ↓ 全失败(如页面改版/场景漂移)
+真实 SSO 登录页全流程(1 次,真键盘真鼠标行为链)
+    ↓ 仍失败
+人工登录:本地 HTTP 服务(127.0.0.1:9527),浏览器打开 SSO 链接手动登录,
+重定向自动回调捕获 Token(300 秒超时)
+```
+
+> 账号不存在/密码错误等账密类拒绝不会重试(重试无意义),会提示具体原因。
+> 同 IP 高频尝试会触发风控惩罚,请勿反复强行重试。
 
 ---
 
@@ -151,6 +186,7 @@
 git clone https://github.com/atvkh/ICVE_Toolkit.git
 cd ICVE_Toolkit
 pip install -r requirements.txt
+playwright install chromium
 ```
 
 ### 运行
@@ -164,7 +200,7 @@ python main.py
 
 ### 使用流程
 
-1. 选择 `[1] 登录`，浏览器打开链接完成登录
+1. 选择 `[1] 登录`，输入账号密码后自动过滑块登录（回车后约 2~4 秒；自动登录失败会自动重试并转人工兜底，详见[登录流程](#登录流程)）
 2. 选择 `[2] 查看我的课程`，确认课程列表
 3. 选择 `[3] 一键刷课`，选择课程和刷课范围
 4. 选择 `[4] 签到 / 改签` 进行补签或代改考勤
@@ -177,13 +213,14 @@ python main.py
 ICVE_Toolkit/
 ├── main.py              # CLI 入口 + 交互式菜单
 ├── zjy_client.py        # API 客户端(三域鉴权 + 课程/刷课/签到/答题)
-├── auth.py              # 登录(HTTPServer 回调 Token)
+├── auth.py              # 登录(自动滑块登录 + 人工回调兜底)
+├── slider_auto.py       # 全自动滑块登录(账密 → 过阿里云滑块 → SSO Token)
 ├── accounts.py          # 账号管理(JSON 存储)
 ├── speed_course.py      # 刷课(SPOC/MOOC/资源库 进度+答题+讨论)
 ├── answer.py            # 自动答题(答案抓取+提交)
 ├── sign.py              # 签到列表/补签/代改考勤
 ├── utils.py             # 日志/格式化工具
-├── requirements.txt     # 依赖(requests + pycryptodome)
+├── requirements.txt     # 依赖(requests + pycryptodome + 滑块登录全家桶:playwright/opencv/numpy/scipy/pillow)
 ├── start.bat            # Windows 一键启动
 ├── LICENSE              # PolyForm Noncommercial 1.0.0
 └── docs/                # 证据图片
@@ -202,7 +239,7 @@ ICVE_Toolkit/
 | 主域 zjy2 | SPOC/MOOC 课程 | SSO Token → passLogin → Bearer Token |
 | AI 域 ai | MOOC 课程设计/讨论/考试 | SSO Token → passLogin → X-AI-Token(401 自动重新鉴权) |
 | 资源库域 zyk | 资源库课程 | SSO Token → passLogin → Bearer Token |
-| SSO 域 sso | 单点登录 | 用户手动登录 |
+| SSO 域 sso | 单点登录 | 账密自动登录(滑块) / 人工回调兜底 |
 
 ### 答案数据源优先级
 

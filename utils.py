@@ -41,7 +41,7 @@ def _supports_ansi() -> bool:
         return False
 
 
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.2.0"
 
 
 def print_banner() -> None:
