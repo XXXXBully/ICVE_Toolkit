@@ -1,6 +1,9 @@
 # 账号凭据(含 token,禁止提交)
 accounts.json
 
+# 滑块映射自校准运行时数据(本地积累,勿提交)
+slider_calib.json
+
 # Python
 __pycache__/
 *.py[cod]

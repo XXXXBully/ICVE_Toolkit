@@ -4,7 +4,7 @@
   1. 预热(与 CLI 输账密并行):同源加载自建极简登录页(robots.txt + set_content,
      无协议框/无登录tab/无推广弹窗),自动弹滑块、预加载拼图图
   2. 提交账密:JS 注入到自建页输入框(自建页无表单行为评分,瞬时完成)→ 鼠标热身
-  3. 拖拽:白帽+Canny 双证据识别缺口 → 二次映射(left = 0.00355·d² + 0.0765·d)
+  3. 拖拽:白帽+Canny 双证据识别缺口 → 二次映射(left = 0.00355·d² + 0.0765·d,系数在线自校准)
      反解拖距 → 真人形态轨迹(~50-70Hz)→ 闭环读 #aliyunCaptcha-puzzle 收敛 <0.7px
   4. verify 回调拿 captchaVerifyParam(cvp)后,页面立即 fetch userLogin(单次使用,
      非重放)→ 拦截响应取 data.token(sso_token)
@@ -17,10 +17,12 @@
   - 拖拽轨迹形态/闭环参数为实证校准值:拖太快会被风控拒(F001),勿再压缩
   - captchaVerifyParam 一次性不可重放:回调内立即使用,禁止存储复用
   - 同 IP 高频尝试会触发风控惩罚(响应延迟 5s+),失败后须退避等待
+  - 映射自校准:在线重拟合仅接受通过质量/合理性校验的拟合,异常时死守经验初值
 """
 
 import importlib
 import io
+import json
 import os
 import queue
 import random
@@ -126,7 +128,9 @@ SSO_ORIGIN = 'https://sso.icve.com.cn'
 CAPTCHA_SCENE_ID = 'e7gyz100'      # SSO 滑块场景 ID(抓包确认的业务常量)
 CAPTCHA_PREFIX = '106eu7'          # 阿里云验证码实例前缀(同上)
 PUZZLE_SCALE = 300.0 / 296.0       # 拼图显示尺寸(300) / 原图尺寸(296)
-MAP_A, MAP_B = 0.00355, 0.0765     # 二次映射:left = A·d² + B·d(实测拟合误差 0.1%)
+# 二次映射:left = A·d² + B·d(实测拟合误差 0.1%)。以下为经验初值,运行时由"映射自校准"
+# 用真实(拖距,拼图位移)样本在线重拟合刷新,仅采纳通过质量校验的拟合结果
+MAP_A, MAP_B = 0.00355, 0.0765
 
 VIEWPORT = {'width': 1280, 'height': 850}
 USER_AGENT = ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
@@ -283,6 +287,100 @@ def identify_gap(back_bytes: bytes, shadow_bytes: bytes):
     else:                                   # 分歧:取白帽,罚置信
         gap_x1, conf = (l1[0], c1) if c1 >= c2 else (l2[0], c2 * 0.8)
     return float(gap_x1), shape_x0, float(conf)
+
+
+# ==================== 映射自校准(自适应滑块参数漂移) ====================
+# 每次拖拽完成即得一个真实观测(拖距 d, 拼图位移 left),与验证通过与否无关——
+# 失败尝试同样是有效样本。样本足够且拖距分布充分时,对 left = A·d² + B·d 做最小二乘重拟合,
+# 持久化到 slider_calib.json(运行时数据,勿提交);任一质量闸不过则保持经验初值。
+# 目的:阿里云调整拖距→位移曲线时自愈,无需重新手工标定。
+
+_CALIB_MIN_SAMPLES = 5      # 起拟合的最小样本数
+_CALIB_MAX_SAMPLES = 24     # 滑动窗口:只保留最近样本(跟踪最新曲线)
+_calib_samples = []         # [(d, left), ...]
+_calib_loaded = False
+CAL_A, CAL_B = MAP_A, MAP_B
+
+
+def _calib_path():
+    """校准数据文件:打包后放 exe 旁(临时目录重启即失),源码运行放脚本旁。"""
+    if getattr(sys, 'frozen', False):
+        return Path(sys.executable).parent / 'slider_calib.json'
+    return Path(__file__).resolve().parent / 'slider_calib.json'
+
+
+def _sane_curve(a: float, b: float) -> bool:
+    """校准结果合理性:曲线单调为正,且典型拖距处的位移相对经验值漂移不过分。"""
+    if not (1e-5 < a < 1.0 and 0.0 <= b < 2.0):
+        return False
+    base = MAP_A * 150.0 ** 2 + MAP_B * 150.0    # 典型拖距 150px 处的经验位移
+    cur = a * 150.0 ** 2 + b * 150.0
+    return 0.4 * base <= cur <= 2.5 * base
+
+
+def _calib_load():
+    """加载历史样本与校准结果(幂等;文件损坏不致命,回退经验初值)。"""
+    global _calib_samples, CAL_A, CAL_B, _calib_loaded
+    if _calib_loaded:
+        return
+    _calib_loaded = True
+    try:
+        data = json.loads(_calib_path().read_text(encoding='utf-8'))
+        _calib_samples = [(float(d), float(l)) for d, l in data.get('samples', [])][-_CALIB_MAX_SAMPLES:]
+        a, b = float(data.get('a', MAP_A)), float(data.get('b', MAP_B))
+        if _sane_curve(a, b):
+            CAL_A, CAL_B = a, b
+    except Exception:
+        pass
+
+
+def _calib_save():
+    try:
+        _calib_path().write_text(
+            json.dumps({'a': CAL_A, 'b': CAL_B, 'samples': _calib_samples}, ensure_ascii=False),
+            encoding='utf-8')
+    except Exception:
+        pass
+
+
+def _calib_refit():
+    """最小二乘重拟合;样本不足/拖距过集中/拟合偏差大/违反合理性 → 保持当前值。"""
+    global CAL_A, CAL_B
+    if len(_calib_samples) < _CALIB_MIN_SAMPLES:
+        return
+    try:
+        ds = np.array([s[0] for s in _calib_samples], dtype=np.float64)
+        ls = np.array([s[1] for s in _calib_samples], dtype=np.float64)
+        if ds.std() < 20.0:                      # 拖距分布过集中,二次拟合病态
+            return
+        coef, *_ = np.linalg.lstsq(np.column_stack([ds ** 2, ds]), ls, rcond=None)
+        a, b = float(coef[0]), float(coef[1])
+        resid = np.abs((a * ds ** 2 + b * ds) - ls)
+        if resid.mean() > 3.0 or not _sane_curve(a, b):   # 平均偏差 >3px 或违反合理性
+            return
+        if abs(a - CAL_A) > 1e-6 or abs(b - CAL_B) > 1e-6:
+            log(f'  [自动登录] 映射自校准更新: A={a:.5f} B={b:.4f}'
+                f'(n={len(ds)}, 平均偏差 {resid.mean():.2f}px)', 'DEBUG')
+        CAL_A, CAL_B = a, b
+    except Exception:
+        pass
+
+
+def calib_observe(d: float, left: float):
+    """记录一次拖拽观测(闭环收敛后、mouse.up 前调用),自动重拟合 + 持久化。"""
+    _calib_load()
+    if not (10.0 <= d <= 400.0 and 0.0 <= left <= 300.0):   # 拒绝明显异常样本(如动画未落定)
+        return
+    _calib_samples.append((round(float(d), 2), round(float(left), 2)))
+    del _calib_samples[:-_CALIB_MAX_SAMPLES]
+    _calib_refit()
+    _calib_save()
+
+
+def _invert_map(left: float) -> float:
+    """位移 → 拖距反解(用当前生效的校准系数)。"""
+    _calib_load()
+    return (-CAL_B + (CAL_B ** 2 + 4 * CAL_A * left) ** 0.5) / (2 * CAL_A)
 
 
 # ==================== 真人形态轨迹(形态照抄 bench15,采样 ~50-70Hz) ====================
@@ -457,7 +555,7 @@ def _solve_slider(page, captured: dict):
     """识别缺口 → 反解拖距 → 真人轨迹拖拽 → 闭环校正 → mouse.up(参数照抄 bench15)。"""
     gap_x1, shape_x0, conf = identify_gap(captured['back'], captured['shadow'])
     left_target = (gap_x1 - shape_x0) * PUZZLE_SCALE
-    d_est = (-MAP_B + (MAP_B**2 + 4*MAP_A*left_target) ** 0.5) / (2*MAP_A)
+    d_est = _invert_map(left_target)
     log(f"  [自动登录] 缺口 x={gap_x1:.1f} conf={conf:.2f} 拖距≈{d_est:.1f}px", "DEBUG")
 
     slider = page.locator('#aliyunCaptcha-sliding-slider')
@@ -494,6 +592,10 @@ def _solve_slider(page, captured: dict):
         page.mouse.move(cur_x, sy + oy + random.uniform(-0.4, 0.4))
         time.sleep(random.uniform(0.010, 0.024))
     page.wait_for_timeout(random.uniform(25, 60))
+    try:   # 自校准采样:(实际拖距, 实际拼图位移),拖拽已落定、松手前读取最稳定
+        calib_observe(cur_x - (sx + ox), get_left())
+    except Exception:
+        pass
     page.mouse.up()
 
 
